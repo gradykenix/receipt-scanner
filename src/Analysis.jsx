@@ -1,31 +1,197 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef, useEffect } from 'react'
 
-// ===== PALETTE =====
+// ===== BLUE-GREEN PALETTE =====
 const C = {
-  bg: '#f7f7f5',
+  bg: '#f8f9f7',
   card: '#ffffff',
-  text: '#1a1a1a',
-  sub: '#6b6b6b',
-  accent: '#e85d3a',
-  accent2: '#2d6a4f',
-  accent3: '#457b9d',
-  border: '#e8e8e4',
-  light: '#f0efeb',
+  text: '#1a2e2a',
+  sub: '#6b8a83',
+  accent: '#0d9488',     // teal-600
+  accent2: '#065f46',    // emerald-800
+  accent3: '#2dd4bf',    // teal-300
+  border: '#d1e5e0',
+  light: '#ecf5f2',
+  dark: '#134e4a',       // teal-900
 }
 
-const TILE_COLORS = [
-  '#e85d3a', '#2d6a4f', '#457b9d', '#ab47bc', '#ff9800',
-  '#26c6da', '#ec407a', '#8d6e63', '#5c6bc0', '#66bb6a',
-  '#ef5350', '#ffa726', '#42a5f5', '#78909c', '#d4e157',
-  '#7e57c2', '#29b6f6', '#c62828', '#00897b', '#f06292',
+// Blue-green shades for mosaic Voronoi cells
+const MOSAIC_COLORS = [
+  '#0d9488', '#0f766e', '#115e59', '#065f46', '#047857',
+  '#059669', '#10b981', '#14b8a6', '#2dd4bf', '#5eead4',
+  '#134e4a', '#0e7490', '#0891b2', '#06b6d4', '#22d3ee',
+  '#0d7377', '#0a8f6e', '#0c5c4c', '#087d6a', '#039a7e',
+  '#1a7a6d', '#0b6e5f', '#138a7a', '#0f9b8e', '#17a89a',
 ]
 
 const CATEGORY_COLORS = {
-  produce: '#4caf50', dairy: '#42a5f5', meat: '#ef5350',
-  bakery: '#ff9800', snacks: '#ab47bc', beverages: '#26c6da',
-  deli: '#ec407a', frozen: '#78909c', pantry: '#8d6e63', other: '#bdbdbd',
+  produce: '#059669', dairy: '#0891b2', meat: '#0d9488',
+  bakery: '#14b8a6', snacks: '#0e7490', beverages: '#06b6d4',
+  deli: '#047857', frozen: '#2dd4bf', pantry: '#065f46', other: '#6b8a83',
 }
 
+// ===== VORONOI COMPUTATION =====
+// Simple Fortune's algorithm is complex; instead we use a practical approach:
+// For each pixel (well, for each cell), find the nearest seed point.
+// But we're using SVG polygons, so we compute Voronoi via the dual of Delaunay.
+// Actually, simplest correct approach: use the edge-intersection method.
+// For a hackathon, let's use a clean iterative approach that builds polygons
+// by computing half-plane intersections for each seed point.
+
+function generateBufferedPoints(count, width, height, buffer) {
+  const points = []
+  let attempts = 0
+  const maxAttempts = count * 100
+
+  while (points.length < count && attempts < maxAttempts) {
+    const x = buffer + Math.random() * (width - 2 * buffer)
+    const y = buffer + Math.random() * (height - 2 * buffer)
+    let tooClose = false
+    for (const p of points) {
+      const dx = p.x - x
+      const dy = p.y - y
+      if (Math.sqrt(dx * dx + dy * dy) < buffer) {
+        tooClose = true
+        break
+      }
+    }
+    if (!tooClose) points.push({ x, y })
+    attempts++
+  }
+  return points
+}
+
+// Compute Voronoi cell for a point by intersecting half-planes
+// Each neighboring point creates a half-plane (the side closer to our point)
+// We intersect all half-planes with the bounding rectangle
+function computeVoronoiCell(idx, seeds, clipRect) {
+  const { x: cx, y: cy } = seeds[idx]
+  // Start with bounding rectangle as polygon
+  let poly = [
+    { x: clipRect.x, y: clipRect.y },
+    { x: clipRect.x + clipRect.w, y: clipRect.y },
+    { x: clipRect.x + clipRect.w, y: clipRect.y + clipRect.h },
+    { x: clipRect.x, y: clipRect.y + clipRect.h },
+  ]
+
+  for (let j = 0; j < seeds.length; j++) {
+    if (j === idx) continue
+    const { x: ox, y: oy } = seeds[j]
+    // Bisector between seed[idx] and seed[j]
+    const mx = (cx + ox) / 2
+    const my = (cy + oy) / 2
+    // Normal pointing toward our seed
+    const nx = cx - ox
+    const ny = cy - oy
+    // Clip polygon by half-plane: keep side where dot(p - m, n) >= 0
+    poly = clipPolygonByHalfPlane(poly, mx, my, nx, ny)
+    if (poly.length === 0) break
+  }
+  return poly
+}
+
+function clipPolygonByHalfPlane(poly, mx, my, nx, ny) {
+  if (poly.length === 0) return []
+  const out = []
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i]
+    const b = poly[(i + 1) % poly.length]
+    const dA = (a.x - mx) * nx + (a.y - my) * ny
+    const dB = (b.x - mx) * nx + (b.y - my) * ny
+    if (dA >= 0) out.push(a)
+    if ((dA >= 0) !== (dB >= 0)) {
+      // Edge crosses the line — find intersection
+      const t = dA / (dA - dB)
+      out.push({
+        x: a.x + t * (b.x - a.x),
+        y: a.y + t * (b.y - a.y),
+      })
+    }
+  }
+  return out
+}
+
+function polygonToPath(poly) {
+  if (poly.length === 0) return ''
+  return poly.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ' Z'
+}
+
+// ===== VORONOI MOSAIC COMPONENT =====
+function VoronoiMosaic({ items, onSelect, width = 340, height = 380 }) {
+  // Generate seed points with buffer (deterministic per session via useMemo)
+  const { seeds, cells } = useMemo(() => {
+    const count = Math.min(items.length, 16)
+    // Use a seeded-ish approach: place points with good spacing
+    const buffer = Math.min(width, height) / (count * 0.6)
+    const pts = generateBufferedPoints(count, width, height, buffer * 0.5)
+    const clipRect = { x: 0, y: 0, w: width, h: height }
+    const cls = pts.map((_, i) => computeVoronoiCell(i, pts, clipRect))
+    return { seeds: pts, cells: cls }
+  }, [items.length, width, height])
+
+  // Compute centroids for text placement
+  const centroids = cells.map(poly => {
+    if (poly.length === 0) return { x: 0, y: 0 }
+    const cx = poly.reduce((s, p) => s + p.x, 0) / poly.length
+    const cy = poly.reduce((s, p) => s + p.y, 0) / poly.length
+    return { x: cx, y: cy }
+  })
+
+  // Estimate cell size for font sizing
+  const cellAreas = cells.map(poly => {
+    if (poly.length < 3) return 0
+    let area = 0
+    for (let i = 0; i < poly.length; i++) {
+      const j = (i + 1) % poly.length
+      area += poly[i].x * poly[j].y - poly[j].x * poly[i].y
+    }
+    return Math.abs(area) / 2
+  })
+
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`}
+      style={{ display: 'block', margin: '0 auto', borderRadius: '16px', overflow: 'hidden' }}>
+      {/* Background */}
+      <rect x="0" y="0" width={width} height={height} fill={C.bg} />
+
+      {cells.map((poly, i) => {
+        if (i >= items.length || poly.length === 0) return null
+        const item = items[i]
+        const color = MOSAIC_COLORS[i % MOSAIC_COLORS.length]
+        const centroid = centroids[i]
+        const area = cellAreas[i]
+        const fontSize = Math.max(9, Math.min(14, Math.sqrt(area) / 8))
+        const name = item.name.length > 14 ? item.name.substring(0, 12) + '…' : item.name
+
+        return (
+          <g key={i} onClick={() => onSelect(item.name.toLowerCase())} style={{ cursor: 'pointer' }}>
+            <path d={polygonToPath(poly)} fill={color}
+              stroke={C.bg} strokeWidth="4"
+              style={{ transition: 'opacity 0.15s' }}
+              onMouseEnter={(e) => e.currentTarget.style.opacity = '0.8'}
+              onMouseLeave={(e) => e.currentTarget.style.opacity = '1'}
+            />
+            <text x={centroid.x} y={centroid.y - fontSize * 0.3}
+              textAnchor="middle" dominantBaseline="middle"
+              fill="white" fontSize={fontSize} fontWeight="700"
+              fontFamily="DM Sans, sans-serif"
+              style={{ pointerEvents: 'none', textShadow: '0 1px 2px rgba(0,0,0,0.3)' }}>
+              {name}
+            </text>
+            <text x={centroid.x} y={centroid.y + fontSize * 0.9}
+              textAnchor="middle" dominantBaseline="middle"
+              fill="rgba(255,255,255,0.75)" fontSize={fontSize * 0.75} fontWeight="600"
+              fontFamily="DM Sans, sans-serif"
+              style={{ pointerEvents: 'none' }}>
+              ×{item.count}
+            </text>
+          </g>
+        )
+      })}
+    </svg>
+  )
+}
+
+// ===== COMPONENTS =====
 function Slide({ children, subtitle }) {
   return (
     <div style={{
@@ -68,33 +234,60 @@ function Bar({ label, value, maxValue, color = C.accent, suffix = '' }) {
   )
 }
 
-function Sparkline({ points, width = 200, height = 60 }) {
+// Zero-anchored sparkline
+function Sparkline({ points, width = 240, height = 70 }) {
   if (!points || points.length < 2) return null
   const prices = points.map(p => p.price)
-  const min = Math.min(...prices)
-  const max = Math.max(...prices)
+  const min = 0 // anchored to zero
+  const max = Math.max(...prices) * 1.1 // 10% headroom
   const range = max - min || 1
+  const plotTop = 8
+  const plotBottom = height - 18
+  const plotH = plotBottom - plotTop
+
   const coords = points.map((p, i) => ({
-    x: (i / (points.length - 1)) * width,
-    y: height - ((p.price - min) / range) * (height - 10) - 5,
+    x: 16 + (i / (points.length - 1)) * (width - 32),
+    y: plotBottom - ((p.price - min) / range) * plotH,
   }))
+
   const pathD = coords.map((c, i) => `${i === 0 ? 'M' : 'L'} ${c.x} ${c.y}`).join(' ')
   const isUp = prices[prices.length - 1] > prices[0]
+  const lineColor = isUp ? '#ef4444' : C.accent2
+
+  // Area fill
+  const areaD = pathD + ` L ${coords[coords.length - 1].x} ${plotBottom} L ${coords[0].x} ${plotBottom} Z`
+
   return (
     <svg width={width} height={height} style={{ display: 'block', margin: '8px auto' }}>
-      <path d={pathD} fill="none" stroke={isUp ? C.accent : C.accent2}
+      {/* Zero line */}
+      <line x1={16} y1={plotBottom} x2={width - 16} y2={plotBottom}
+        stroke={C.border} strokeWidth="1" />
+      {/* $0 label */}
+      <text x={8} y={plotBottom + 3} fontSize="9" fill={C.sub}>$0</text>
+      {/* Max label */}
+      <text x={8} y={plotTop + 3} fontSize="9" fill={C.sub}>${max.toFixed(0)}</text>
+      {/* Area */}
+      <path d={areaD} fill={lineColor} opacity="0.1" />
+      {/* Line */}
+      <path d={pathD} fill="none" stroke={lineColor}
         strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+      {/* Dots */}
       {coords.map((c, i) => (
-        <circle key={i} cx={c.x} cy={c.y} r="3" fill={isUp ? C.accent : C.accent2} />
+        <circle key={i} cx={c.x} cy={c.y} r="3" fill={lineColor} />
       ))}
-      <text x={0} y={height - 2} fontSize="10" fill={C.sub}>{points[0].date}</text>
-      <text x={width} y={height - 2} fontSize="10" fill={C.sub} textAnchor="end">
+      {/* Date labels */}
+      <text x={coords[0].x} y={height - 2} fontSize="9" fill={C.sub} textAnchor="start">
+        {points[0].date}
+      </text>
+      <text x={coords[coords.length - 1].x} y={height - 2} fontSize="9" fill={C.sub} textAnchor="end">
         {points[points.length - 1].date}
       </text>
     </svg>
   )
 }
 
+
+// ===== MAIN =====
 export default function Analysis({ receipts, onClose }) {
   const [slide, setSlide] = useState(0)
   const [selectedTile, setSelectedTile] = useState(null)
@@ -151,7 +344,7 @@ export default function Analysis({ receipts, onClose }) {
         cheapestStore, cheapestPrice, timeline, storeLatest, storesAvailable,
       }
     })
-    const topItems = Object.values(itemStats).sort((a, b) => b.count - a.count).slice(0, 24)
+    const topItems = Object.values(itemStats).sort((a, b) => b.count - a.count).slice(0, 16)
     const computeBasket = (receiptId) => {
       if (!receiptId) return null
       const basketReceipt = receipts.find(r => r.id === receiptId)
@@ -226,7 +419,7 @@ export default function Analysis({ receipts, onClose }) {
         <p style={{ fontSize: '13px', color: C.sub, letterSpacing: '3px', textTransform: 'uppercase', marginBottom: '20px' }}>
           Your Grocery
         </p>
-        <h1 style={{ fontSize: '48px', fontWeight: 800, color: C.text, margin: 0, lineHeight: 1.1 }}>
+        <h1 style={{ fontSize: '48px', fontWeight: 800, color: C.dark, margin: 0, lineHeight: 1.1 }}>
           Mosaic
         </h1>
         <p style={{ fontSize: '15px', color: C.sub, marginTop: '16px' }}>
@@ -242,43 +435,24 @@ export default function Analysis({ receipts, onClose }) {
     </Slide>
   )
 
-  // MOSAIC
+  // VORONOI MOSAIC
   slides.push(
     <Slide key="mosaic" subtitle="Your Grocery Mosaic">
-      <h2 style={{ fontSize: '24px', fontWeight: 800, color: C.text, margin: '0 0 6px 0' }}>
-        Tap any tile to explore
+      <h2 style={{ fontSize: '22px', fontWeight: 800, color: C.text, margin: '0 0 6px 0' }}>
+        Tap any cell to explore
       </h2>
-      <p style={{ fontSize: '14px', color: C.sub, margin: '0 0 20px 0' }}>
-        Your most purchased items, sized by frequency
+      <p style={{ fontSize: '14px', color: C.sub, margin: '0 0 16px 0' }}>
+        Your top items, arranged as a mosaic
       </p>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', justifyContent: 'center' }}>
-        {stats.topItems.map((item, i) => {
-          const maxCount = stats.topItems[0].count
-          const ratio = item.count / maxCount
-          const size = Math.round(70 + ratio * 60)
-          const color = TILE_COLORS[i % TILE_COLORS.length]
-          return (
-            <div key={item.name} onClick={() => setSelectedTile(item.name.toLowerCase())}
-              style={{
-                width: `${size}px`, height: `${size}px`, backgroundColor: color,
-                borderRadius: '10px', display: 'flex', flexDirection: 'column',
-                alignItems: 'center', justifyContent: 'center',
-                cursor: 'pointer', padding: '6px', transition: 'transform 0.15s',
-                overflow: 'hidden',
-              }}>
-              <span style={{
-                color: 'white', fontSize: size > 90 ? '13px' : '11px',
-                fontWeight: 700, textAlign: 'center', lineHeight: 1.2,
-                wordBreak: 'break-word', textShadow: '0 1px 3px rgba(0,0,0,0.3)',
-              }}>{item.name}</span>
-              <span style={{
-                color: 'rgba(255,255,255,0.8)', fontSize: '11px', fontWeight: 600, marginTop: '2px',
-              }}>×{item.count}</span>
-            </div>
-          )
-        })}
-      </div>
 
+      <VoronoiMosaic
+        items={stats.topItems}
+        onSelect={(name) => setSelectedTile(name)}
+        width={340}
+        height={380}
+      />
+
+      {/* POPUP */}
       {selectedTile && stats.itemStats[selectedTile] && (() => {
         const item = stats.itemStats[selectedTile]
         return (
@@ -291,14 +465,16 @@ export default function Analysis({ receipts, onClose }) {
               position: 'fixed', bottom: 0, left: 0, right: 0,
               backgroundColor: C.card, borderRadius: '20px 20px 0 0',
               padding: '24px 24px 40px', zIndex: 101,
-              maxHeight: '70vh', overflowY: 'auto',
+              maxHeight: '75vh', overflowY: 'auto',
               boxShadow: '0 -4px 20px rgba(0,0,0,0.15)',
             }}>
               <div style={{
                 width: '40px', height: '4px', backgroundColor: C.border,
                 borderRadius: '2px', margin: '0 auto 16px',
               }} />
-              <h3 style={{ fontSize: '22px', fontWeight: 800, margin: '0 0 16px 0' }}>{item.name}</h3>
+              <h3 style={{ fontSize: '22px', fontWeight: 800, margin: '0 0 16px 0', color: C.dark }}>
+                {item.name}
+              </h3>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '16px' }}>
                 <div style={{ backgroundColor: C.light, borderRadius: '10px', padding: '12px' }}>
                   <div style={{ fontSize: '24px', fontWeight: 800, color: C.accent }}>${item.totalSpentOnItem.toFixed(2)}</div>
@@ -313,7 +489,7 @@ export default function Analysis({ receipts, onClose }) {
                   <div style={{ fontSize: '12px', color: C.sub, marginTop: '2px' }}>Times bought</div>
                 </div>
                 <div style={{ backgroundColor: C.light, borderRadius: '10px', padding: '12px' }}>
-                  <div style={{ fontSize: '20px', fontWeight: 800, color: '#ab47bc' }}>{item.cheapestStore}</div>
+                  <div style={{ fontSize: '18px', fontWeight: 800, color: C.dark }}>{item.cheapestStore}</div>
                   <div style={{ fontSize: '12px', color: C.sub, marginTop: '2px' }}>Cheapest @ ${item.cheapestPrice.toFixed(2)}</div>
                 </div>
               </div>
@@ -344,17 +520,13 @@ export default function Analysis({ receipts, onClose }) {
                   <p style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1.5px', color: C.sub, fontWeight: 600, marginBottom: '4px' }}>
                     Price over time
                   </p>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', color: C.sub, marginBottom: '2px' }}>
-                    <span>${item.timeline[0].price.toFixed(2)}</span>
-                    <span>${item.timeline[item.timeline.length - 1].price.toFixed(2)}</span>
-                  </div>
-                  <Sparkline points={item.timeline} width={280} height={60} />
+                  <Sparkline points={item.timeline} width={280} height={80} />
                 </div>
               )}
               <button onClick={() => setSelectedTile(null)} style={{
                 width: '100%', padding: '14px', backgroundColor: C.light,
                 border: 'none', borderRadius: '12px', fontSize: '16px',
-                fontWeight: 600, cursor: 'pointer', color: C.text, marginTop: '16px',
+                fontWeight: 600, cursor: 'pointer', color: C.text, marginTop: '12px',
               }}>Close</button>
             </div>
           </>
@@ -366,15 +538,15 @@ export default function Analysis({ receipts, onClose }) {
   // BASKET COMPARISON
   slides.push(
     <Slide key="basket" subtitle="Store Showdown">
-      <h2 style={{ fontSize: '24px', fontWeight: 800, color: C.text, margin: '0 0 6px 0' }}>
+      <h2 style={{ fontSize: '22px', fontWeight: 800, color: C.text, margin: '0 0 6px 0' }}>
         Which store wins?
       </h2>
       <p style={{ fontSize: '14px', color: C.sub, margin: '0 0 20px 0' }}>
-        Pick a receipt as your basket, then see which store is cheapest for those items.
+        Pick a receipt as your basket, then see which store would be cheapest.
       </p>
       <button onClick={() => setShowBasketPicker(!showBasketPicker)} style={{
         width: '100%', padding: '14px', backgroundColor: C.card,
-        border: `1px solid ${basketReceiptId ? C.accent2 : C.border}`,
+        border: `1px solid ${basketReceiptId ? C.accent : C.border}`,
         borderRadius: '12px', fontSize: '15px', cursor: 'pointer',
         textAlign: 'left', color: C.text, fontWeight: 600,
       }}>
@@ -393,7 +565,7 @@ export default function Analysis({ receipts, onClose }) {
                 padding: '12px 16px', cursor: 'pointer', borderBottom: `1px solid ${C.border}`,
                 backgroundColor: r.id === basketReceiptId ? C.light : 'transparent',
               }}>
-              <div style={{ fontWeight: 600 }}>{r.store} — {r.date}</div>
+              <div style={{ fontWeight: 600, color: C.text }}>{r.store} — {r.date}</div>
               <div style={{ fontSize: '13px', color: C.sub }}>{r.items.length} items · ${r.total.toFixed(2)}</div>
             </div>
           ))}
@@ -413,9 +585,10 @@ export default function Analysis({ receipts, onClose }) {
               <p style={{ fontSize: '13px', color: C.sub, marginBottom: '16px' }}>
                 Comparing {basketResult.restrictedItems.length} item{basketResult.restrictedItems.length !== 1 ? 's' : ''} found at all {stats.storesWithReceipts.length} stores
                 {basketResult.restrictedItems.length < (basketResult.basketReceipt?.items.length || 0) && (
-                  <span> ({basketResult.basketReceipt.items.length - basketResult.restrictedItems.length} excluded — not sold everywhere)</span>
+                  <span> ({basketResult.basketReceipt.items.length - basketResult.restrictedItems.length} excluded)</span>
                 )}
               </p>
+              {/* PODIUM */}
               <div style={{
                 display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
                 gap: '8px', marginBottom: '24px', marginTop: '10px', minHeight: '180px',
@@ -425,8 +598,9 @@ export default function Analysis({ receipts, onClose }) {
                   const h = heights[i] || 60
                   const medals = ['🥇', '🥈', '🥉']
                   const medal = medals[i] || `#${i + 1}`
-                  const colors = [C.accent2, C.accent3, '#8d6e63']
-                  const color = colors[i] || C.sub
+                  // Blue-green gradient for podium
+                  const podiumColors = [C.accent2, C.accent, '#2dd4bf']
+                  const color = podiumColors[i] || C.sub
                   return (
                     <div key={sc.store} style={{
                       display: 'flex', flexDirection: 'column',
@@ -449,8 +623,8 @@ export default function Analysis({ receipts, onClose }) {
               </div>
               {basketResult.storeCosts.length >= 2 && (
                 <div style={{
-                  padding: '16px', backgroundColor: '#f0fdf4',
-                  borderRadius: '12px', border: '1px solid #bbf7d0', textAlign: 'center',
+                  padding: '16px', backgroundColor: C.light,
+                  borderRadius: '12px', border: `1px solid ${C.border}`, textAlign: 'center',
                 }}>
                   <p style={{ fontSize: '14px', color: C.accent2, fontWeight: 700, margin: 0 }}>
                     {basketResult.storeCosts[0].store} saves you ${(
@@ -471,7 +645,7 @@ export default function Analysis({ receipts, onClose }) {
                     if (!item) return null
                     return (
                       <div key={name} style={{ padding: '8px 0', borderBottom: `1px solid ${C.border}` }}>
-                        <div style={{ fontSize: '14px', fontWeight: 600, marginBottom: '4px' }}>{item.name}</div>
+                        <div style={{ fontSize: '14px', fontWeight: 600, marginBottom: '4px', color: C.text }}>{item.name}</div>
                         <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
                           {Object.entries(item.storeLatest).sort((a, b) => a[1].price - b[1].price).map(([store, { price }]) => (
                             <span key={store} style={{
@@ -497,7 +671,7 @@ export default function Analysis({ receipts, onClose }) {
   if (stats.inflationItems.length > 0) {
     slides.push(
       <Slide key="inflation" subtitle="Price Changes">
-        <h2 style={{ fontSize: '24px', fontWeight: 800, color: C.text, margin: '0 0 20px 0' }}>
+        <h2 style={{ fontSize: '22px', fontWeight: 800, color: C.text, margin: '0 0 20px 0' }}>
           What's getting pricier?
         </h2>
         {stats.inflationItems.map((item) => {
@@ -511,7 +685,7 @@ export default function Analysis({ receipts, onClose }) {
                 <div style={{ fontSize: '15px', fontWeight: 600, color: C.text }}>{item.name}</div>
                 <div style={{ fontSize: '13px', color: C.sub }}>${item.first.toFixed(2)} → ${item.last.toFixed(2)}</div>
               </div>
-              <div style={{ fontSize: '18px', fontWeight: 800, color: isUp ? C.accent : C.accent2 }}>
+              <div style={{ fontSize: '18px', fontWeight: 800, color: isUp ? '#ef4444' : C.accent2 }}>
                 {isUp ? '↑' : '↓'} {Math.abs(item.change).toFixed(1)}%
               </div>
             </div>
@@ -524,7 +698,7 @@ export default function Analysis({ receipts, onClose }) {
   // SUMMARY
   slides.push(
     <Slide key="summary" subtitle="The Big Picture">
-      <h2 style={{ fontSize: '24px', fontWeight: 800, color: C.text, margin: '0 0 24px 0' }}>
+      <h2 style={{ fontSize: '22px', fontWeight: 800, color: C.text, margin: '0 0 24px 0' }}>
         Your grocery snapshot
       </h2>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
@@ -532,9 +706,9 @@ export default function Analysis({ receipts, onClose }) {
           { label: 'Total spent', value: `$${stats.totalSpent.toFixed(2)}`, color: C.accent },
           { label: 'Receipts', value: stats.receiptCount, color: C.accent3 },
           { label: 'Items scanned', value: stats.totalItems, color: C.accent2 },
-          { label: 'Avg per trip', value: `$${stats.avgPerTrip.toFixed(2)}`, color: '#ab47bc' },
-          { label: 'Stores visited', value: stats.storesWithReceipts.length, color: '#ff9800' },
-          { label: 'Unique items', value: Object.keys(stats.itemStats).length, color: '#26c6da' },
+          { label: 'Avg per trip', value: `$${stats.avgPerTrip.toFixed(2)}`, color: C.dark },
+          { label: 'Stores visited', value: stats.storesWithReceipts.length, color: '#0891b2' },
+          { label: 'Unique items', value: Object.keys(stats.itemStats).length, color: '#059669' },
         ].map((stat, i) => (
           <div key={i} style={{
             backgroundColor: C.card, borderRadius: '12px',
@@ -554,7 +728,7 @@ export default function Analysis({ receipts, onClose }) {
   if (stats.categoryList.length > 0) {
     slides.push(
       <Slide key="categories" subtitle="Where Your Money Goes">
-        <h2 style={{ fontSize: '24px', fontWeight: 800, color: C.text, margin: '0 0 20px 0' }}>
+        <h2 style={{ fontSize: '22px', fontWeight: 800, color: C.text, margin: '0 0 20px 0' }}>
           Spending by category
         </h2>
         <div style={{
@@ -576,9 +750,9 @@ export default function Analysis({ receipts, onClose }) {
               width: '10px', height: '10px', borderRadius: '50%',
               backgroundColor: CATEGORY_COLORS[category] || CATEGORY_COLORS.other,
             }} />
-            <span style={{ flex: 1, fontSize: '15px', textTransform: 'capitalize' }}>{category}</span>
+            <span style={{ flex: 1, fontSize: '15px', textTransform: 'capitalize', color: C.text }}>{category}</span>
             <span style={{ fontSize: '14px', color: C.sub }}>{pct.toFixed(0)}%</span>
-            <span style={{ fontSize: '14px', fontWeight: 700, width: '70px', textAlign: 'right' }}>
+            <span style={{ fontSize: '14px', fontWeight: 700, width: '70px', textAlign: 'right', color: C.text }}>
               ${total.toFixed(2)}
             </span>
           </div>
